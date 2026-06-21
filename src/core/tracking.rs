@@ -1901,17 +1901,37 @@ mod tests {
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
 
         insert_with_session(&tracker, "git log", "rtk git log", 1000, 100, "sess-aaa");
-        insert_with_session(&tracker, "git status", "rtk git status", 500, 50, "sess-aaa");
-        insert_with_session(&tracker, "cargo test", "rtk cargo test", 2000, 200, "sess-bbb");
+        insert_with_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            500,
+            50,
+            "sess-aaa",
+        );
+        insert_with_session(
+            &tracker,
+            "cargo test",
+            "rtk cargo test",
+            2000,
+            200,
+            "sess-bbb",
+        );
 
         let sessions = tracker.get_by_session(None).expect("get_by_session failed");
         assert_eq!(sessions.len(), 2, "should have 2 distinct sessions");
 
-        let aaa = sessions.iter().find(|s| s.session_id == "sess-aaa").unwrap();
+        let aaa = sessions
+            .iter()
+            .find(|s| s.session_id == "sess-aaa")
+            .unwrap();
         assert_eq!(aaa.commands, 2);
         assert_eq!(aaa.saved_tokens, 1350); // (1000-100) + (500-50)
 
-        let bbb = sessions.iter().find(|s| s.session_id == "sess-bbb").unwrap();
+        let bbb = sessions
+            .iter()
+            .find(|s| s.session_id == "sess-bbb")
+            .unwrap();
         assert_eq!(bbb.commands, 1);
         assert_eq!(bbb.saved_tokens, 1800);
     }
@@ -1966,7 +1986,10 @@ mod tests {
             .expect("insert failed");
 
         let sessions = tracker.get_by_session(None).expect("get_by_session failed");
-        assert_eq!(sessions[0].session_id, "sess-new", "newest session must be first");
+        assert_eq!(
+            sessions[0].session_id, "sess-new",
+            "newest session must be first"
+        );
         assert_eq!(sessions[1].session_id, "sess-old");
     }
 
@@ -1982,8 +2005,22 @@ mod tests {
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
 
         insert_with_session(&tracker, "git log", "rtk git log", 1000, 100, "aaaa-1111");
-        insert_with_session(&tracker, "git status", "rtk git status", 500, 50, "aaaa-2222");
-        insert_with_session(&tracker, "cargo test", "rtk cargo test", 2000, 200, "bbbb-3333");
+        insert_with_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            500,
+            50,
+            "aaaa-2222",
+        );
+        insert_with_session(
+            &tracker,
+            "cargo test",
+            "rtk cargo test",
+            2000,
+            200,
+            "bbbb-3333",
+        );
 
         // filter by "aaaa" prefix matches both aaaa-* sessions
         let filtered = tracker
@@ -2013,7 +2050,14 @@ mod tests {
         // 80% savings
         insert_with_session(&tracker, "git log", "rtk git log", 1000, 200, "sess-x");
         // 60% savings
-        insert_with_session(&tracker, "git status", "rtk git status", 1000, 400, "sess-x");
+        insert_with_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            1000,
+            400,
+            "sess-x",
+        );
 
         let sessions = tracker.get_by_session(None).expect("get_by_session failed");
         assert_eq!(sessions.len(), 1);
