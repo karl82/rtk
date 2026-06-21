@@ -22,17 +22,43 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
 
     match evaluate(cmd, &excluded, &transparent_prefixes) {
         RewriteOutcome::Allow(rewritten) => {
-            print!("{}", rewritten);
+            print!("{}", inject_parent_session(rewritten));
             let _ = std::io::stdout().flush();
             Ok(())
         }
         RewriteOutcome::Ask(rewritten) => {
-            print!("{}", rewritten);
+            print!("{}", inject_parent_session(rewritten));
             let _ = std::io::stdout().flush();
             std::process::exit(3);
         }
         RewriteOutcome::Deny => std::process::exit(2),
         RewriteOutcome::Passthrough => std::process::exit(1),
+    }
+}
+
+/// Inject `--parent-session=<id>` into a rewritten RTK command when the
+/// current process is a Claude Code subagent with a known parent session.
+///
+/// Priority: `CLAUDE_CODE_PARENT_SESSION_ID` → `RTK_PARENT_SESSION_ID`.
+/// When neither is set the command is returned unchanged.
+///
+/// Injection position: immediately after `rtk ` so Clap parses it as a
+/// global flag before routing to the subcommand, e.g.:
+///   `rtk git status` → `rtk --parent-session=abc123 git status`
+fn inject_parent_session(rewritten: String) -> String {
+    let parent_id = std::env::var("CLAUDE_CODE_PARENT_SESSION_ID")
+        .or_else(|_| std::env::var("RTK_PARENT_SESSION_ID"))
+        .unwrap_or_default();
+
+    if parent_id.is_empty() {
+        return rewritten;
+    }
+
+    // Insert after the leading "rtk " prefix.
+    if let Some(rest) = rewritten.strip_prefix("rtk ") {
+        format!("rtk --parent-session={} {}", parent_id, rest)
+    } else {
+        rewritten
     }
 }
 
@@ -88,6 +114,31 @@ mod tests {
             rewrite_command_no_prefixes("rtk git status"),
             Some("rtk git status".into())
         );
+    }
+
+    #[test]
+    fn test_inject_parent_session_no_env_noop() {
+        std::env::remove_var("CLAUDE_CODE_PARENT_SESSION_ID");
+        std::env::remove_var("RTK_PARENT_SESSION_ID");
+        let result = inject_parent_session("rtk git status".to_string());
+        assert_eq!(result, "rtk git status");
+    }
+
+    #[test]
+    fn test_inject_parent_session_injects_before_subcommand() {
+        std::env::set_var("RTK_PARENT_SESSION_ID", "abc-123");
+        let result = inject_parent_session("rtk git status".to_string());
+        std::env::remove_var("RTK_PARENT_SESSION_ID");
+        assert_eq!(result, "rtk --parent-session=abc-123 git status");
+    }
+
+    #[test]
+    fn test_inject_parent_session_non_rtk_command_passthrough() {
+        std::env::set_var("RTK_PARENT_SESSION_ID", "abc-123");
+        let result = inject_parent_session("git status".to_string());
+        std::env::remove_var("RTK_PARENT_SESSION_ID");
+        // Non-rtk command (passthrough case) is returned unchanged
+        assert_eq!(result, "git status");
     }
 
     mod unattestable_passthrough {
