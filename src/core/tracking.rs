@@ -1199,6 +1199,100 @@ impl Tracker {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Get full gain summary for a root session tree (parent + all its subagents).
+    ///
+    /// Matches commands where `session_id GLOB prefix*` (the root itself) OR
+    /// `parent_session_id GLOB prefix*` (any child that declared this as parent).
+    pub fn get_summary_for_root_session(&self, prefix: &str) -> Result<GainSummary> {
+        let glob = format!("{prefix}*");
+        let mut total_commands = 0usize;
+        let mut total_input = 0usize;
+        let mut total_output = 0usize;
+        let mut total_saved = 0usize;
+        let mut total_time_ms = 0u64;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms
+             FROM commands
+             WHERE session_id GLOB ?1 OR parent_session_id GLOB ?1",
+        )?;
+        let rows = stmt.query_map(params![glob], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        for row in rows {
+            let (input, output, saved, time_ms) = row?;
+            total_commands += 1;
+            total_input += input;
+            total_output += output;
+            total_saved += saved;
+            total_time_ms += time_ms;
+        }
+
+        let avg_savings_pct = if total_input > 0 {
+            (total_saved as f64 / total_input as f64) * 100.0
+        } else {
+            0.0
+        };
+        let avg_time_ms = if total_commands > 0 {
+            total_time_ms / total_commands as u64
+        } else {
+            0
+        };
+
+        let by_command = {
+            let mut stmt = self.conn.prepare(
+                "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+                 FROM commands
+                 WHERE session_id GLOB ?1 OR parent_session_id GLOB ?1
+                 GROUP BY rtk_cmd
+                 ORDER BY SUM(saved_tokens) DESC
+                 LIMIT 10",
+            )?;
+            let rows = stmt.query_map(params![glob], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let by_day = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DATE(timestamp), SUM(saved_tokens)
+                 FROM commands
+                 WHERE session_id GLOB ?1 OR parent_session_id GLOB ?1
+                 GROUP BY DATE(timestamp)
+                 ORDER BY DATE(timestamp) ASC
+                 LIMIT 30",
+            )?;
+            let rows = stmt.query_map(params![glob], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(GainSummary {
+            total_commands,
+            total_input,
+            total_output,
+            total_saved,
+            avg_savings_pct,
+            total_time_ms,
+            avg_time_ms,
+            by_command,
+            by_day,
+        })
+    }
+
     /// Get per-root-session token savings, most recent first.
     ///
     /// Each row represents one top-level session and its entire subagent tree.

@@ -75,11 +75,14 @@ pub fn run(
                 .context("Failed to load root session data from database")?;
             return show_root_session_view(&roots, None);
         } else {
-            // --parent-session <id>: list root sessions matching this prefix
+            // --parent-session <id>: full detail for this root session tree
             let roots = tracker
                 .get_by_root_session(Some(ps_filter))
                 .context("Failed to load root session data from database")?;
-            return show_root_session_view(&roots, Some(ps_filter));
+            let summary = tracker
+                .get_summary_for_root_session(ps_filter)
+                .context("Failed to load root session summary from database")?;
+            return show_root_session_detail(ps_filter, &roots, &summary);
         }
     }
 
@@ -741,6 +744,54 @@ fn show_root_session_view(roots: &[RootSessionStat], filter: Option<&str>) -> Re
         total_cmds,
         format_tokens(total_saved),
     );
+    Ok(())
+}
+
+fn show_root_session_detail(
+    prefix: &str,
+    roots: &[RootSessionStat],
+    summary: &GainSummary,
+) -> Result<()> {
+    if summary.total_commands == 0 {
+        println!("No data found for root session '{prefix}'.");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        styled(&format!("RTK Token Savings — Root Session {prefix}"), true)
+    );
+    println!("{}", "═".repeat(60));
+    println!();
+
+    print_summary_kpis(summary);
+
+    // Show per-session breakdown when there are multiple sessions in the tree
+    if roots.len() == 1 && roots[0].session_count > 1 {
+        let root = &roots[0];
+        println!("{}", styled("Sessions in tree", true));
+        println!("──────────────────────────────────────────────────────────");
+        println!(
+            "{:<10}  {:>5}  {:>8}  {:>6}",
+            "Session", "Cmds", "Saved", "Avg%"
+        );
+        println!("──────────────────────────────────────────────────────────");
+        // Show the root itself first, then note children are included
+        let short_id: String = root.session_id.chars().take(8).collect();
+        println!(
+            "{:<10}  {:>5}  {:>8}  {:>5.1}%  (root + {} subagents)",
+            short_id,
+            root.commands,
+            format_tokens(root.saved_tokens),
+            root.avg_savings_pct,
+            root.session_count - 1,
+        );
+        println!("──────────────────────────────────────────────────────────");
+        println!();
+    }
+
+    print_by_command_table(&summary.by_command);
+
     Ok(())
 }
 
