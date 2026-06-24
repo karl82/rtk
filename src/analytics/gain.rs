@@ -1,7 +1,9 @@
 //! Shows users how many tokens RTK has saved them over time.
 
 use crate::core::display_helpers::{format_duration, print_period_table};
-use crate::core::tracking::{DayStats, GainSummary, MonthStats, SessionStat, Tracker, WeekStats};
+use crate::core::tracking::{
+    DayStats, GainSummary, MonthStats, RootSessionStat, SessionStat, Tracker, WeekStats,
+};
 use crate::core::utils::format_tokens;
 use crate::hooks::hook_check;
 use anyhow::{Context, Result};
@@ -17,6 +19,7 @@ pub fn run(
     graph: bool,
     history: bool,
     session: Option<&str>,
+    parent_session: Option<&str>,
     quota: bool,
     tier: &str,
     daily: bool,
@@ -61,6 +64,25 @@ pub fn run(
                 .get_summary_for_session(session_filter)
                 .context("Failed to load session summary from database")?;
             return show_session_detail(session_filter, &summary);
+        }
+    }
+
+    if let Some(ps_filter) = parent_session {
+        if ps_filter.is_empty() {
+            // bare --parent-session: list root sessions (each parent + its subagents)
+            let roots = tracker
+                .get_by_root_session(None)
+                .context("Failed to load root session data from database")?;
+            return show_root_session_view(&roots, None);
+        } else {
+            // --parent-session <id>: full detail for this root session tree
+            let roots = tracker
+                .get_by_root_session(Some(ps_filter))
+                .context("Failed to load root session data from database")?;
+            let summary = tracker
+                .get_summary_for_root_session(ps_filter)
+                .context("Failed to load root session summary from database")?;
+            return show_root_session_detail(ps_filter, &roots, &summary);
         }
     }
 
@@ -656,6 +678,120 @@ fn show_session_view(sessions: &[SessionStat], filter: Option<&str>) -> Result<(
         total_cmds,
         format_tokens(total_saved),
     );
+    Ok(())
+}
+
+fn show_root_session_view(roots: &[RootSessionStat], filter: Option<&str>) -> Result<()> {
+    if roots.is_empty() {
+        if let Some(f) = filter {
+            println!("No root session found matching '{f}'.");
+        } else {
+            println!("No parent-session data yet.");
+            println!(
+                "Requires CLAUDE_CODE_PARENT_SESSION_ID (or RTK_PARENT_SESSION_ID) to be set \
+                 when subagents run, so RTK knows which root session to aggregate under."
+            );
+        }
+        return Ok(());
+    }
+
+    let title = match filter {
+        Some(f) => format!("RTK Root-Session Savings — prefix '{f}'"),
+        None => "RTK Root-Session Savings".to_string(),
+    };
+    println!("{}", styled(&title, true));
+    println!("{}", "─".repeat(68));
+    println!(
+        "{:<10}  {:<12}  {:>8}  {:>5}  {:>8}  {:>6}",
+        "Root", "Last Seen", "Sessions", "Cmds", "Saved", "Avg%"
+    );
+    println!("{}", "─".repeat(68));
+
+    for r in roots {
+        let age = {
+            let secs = (Utc::now() - r.last_seen).num_seconds().max(0) as u64;
+            if secs < 60 {
+                "just now".to_string()
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else if secs < 86400 {
+                format!("{}h ago", secs / 3600)
+            } else {
+                format!("{}d ago", secs / 86400)
+            }
+        };
+        let short_id: String = r.session_id.chars().take(8).collect();
+        let pct_cell = colorize_pct_cell(r.avg_savings_pct, &format!("{:.1}%", r.avg_savings_pct));
+        println!(
+            "{:<10}  {:<12}  {:>8}  {:>5}  {:>8}  {}",
+            short_id,
+            age,
+            r.session_count,
+            r.commands,
+            format_tokens(r.saved_tokens),
+            pct_cell,
+        );
+    }
+
+    println!("{}", "─".repeat(68));
+    let total_sessions: usize = roots.iter().map(|r| r.session_count).sum();
+    let total_cmds: usize = roots.iter().map(|r| r.commands).sum();
+    let total_saved: usize = roots.iter().map(|r| r.saved_tokens).sum();
+    println!(
+        "Total: {} root sessions  •  {} total sessions  •  {} commands  •  {} saved",
+        roots.len(),
+        total_sessions,
+        total_cmds,
+        format_tokens(total_saved),
+    );
+    Ok(())
+}
+
+fn show_root_session_detail(
+    prefix: &str,
+    roots: &[RootSessionStat],
+    summary: &GainSummary,
+) -> Result<()> {
+    if summary.total_commands == 0 {
+        println!("No data found for root session '{prefix}'.");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        styled(&format!("RTK Token Savings — Root Session {prefix}"), true)
+    );
+    println!("{}", "═".repeat(60));
+    println!();
+
+    print_summary_kpis(summary);
+
+    // Show per-session breakdown when there are multiple sessions in the tree
+    if roots.len() == 1 && roots[0].session_count > 1 {
+        let root = &roots[0];
+        println!("{}", styled("Sessions in tree", true));
+        println!("──────────────────────────────────────────────────────────");
+        println!(
+            "{:<10}  {:>5}  {:>8}  {:>6}",
+            "Session", "Cmds", "Saved", "Avg%"
+        );
+        println!("──────────────────────────────────────────────────────────");
+        // Show the root itself first, then note children are included
+        let short_id: String = root.session_id.chars().take(8).collect();
+        println!(
+            "{:<10}  {:>5}  {:>8}  {:>5.1}%  (root + {} subagents)",
+            short_id,
+            root.commands,
+            format_tokens(root.saved_tokens),
+            root.avg_savings_pct,
+            root.session_count - 1,
+        );
+        println!("──────────────────────────────────────────────────────────");
+        println!();
+    }
+
+    print_by_command_table(&summary.by_command);
+
     Ok(())
 }
 

@@ -35,7 +35,18 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Runtime override for parent_session_id, set via `--parent-session` CLI flag.
+/// Takes priority over env vars.
+static PARENT_SESSION_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Set the parent session ID from the CLI `--parent-session` flag.
+/// Must be called before any `record()` calls. Silently ignored on duplicate.
+pub fn set_parent_session_id(id: String) {
+    let _ = PARENT_SESSION_OVERRIDE.set(id);
+}
 
 // ── Project path helpers ── // added: project-scoped tracking support
 
@@ -51,6 +62,21 @@ fn current_project_path_string() -> String {
 /// Get the current Claude Code session ID from the environment.
 fn current_session_id() -> String {
     std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default()
+}
+
+/// Get the parent session ID if this process is a Claude Code subagent.
+///
+/// Checks (in order):
+/// 1. CLI `--parent-session` flag (via `set_parent_session_id`)
+/// 2. `CLAUDE_CODE_PARENT_SESSION_ID` — set by Claude Code when spawning a subagent
+/// 3. `RTK_PARENT_SESSION_ID` — fallback env var for manual override / testing
+fn current_parent_session_id() -> String {
+    if let Some(id) = PARENT_SESSION_OVERRIDE.get() {
+        return id.clone();
+    }
+    std::env::var("CLAUDE_CODE_PARENT_SESSION_ID")
+        .or_else(|_| std::env::var("RTK_PARENT_SESSION_ID"))
+        .unwrap_or_default()
 }
 
 /// Build SQL filter params for project-scoped queries.
@@ -153,6 +179,28 @@ pub struct SessionStat {
     /// Total tokens saved across all commands in this session
     pub saved_tokens: usize,
     /// Average savings percentage across all commands in this session
+    pub avg_savings_pct: f64,
+}
+
+/// Aggregated statistics for a "root" session tree (parent + all its subagents).
+///
+/// When Claude Code spawns subagents (via the Agent tool), each gets its own
+/// `session_id` but records the parent via `parent_session_id`. This struct
+/// aggregates all commands from the root session AND any sessions that list it
+/// as their parent, so users can see total savings for a top-level task.
+#[derive(Debug)]
+pub struct RootSessionStat {
+    /// The root (top-level) session ID
+    pub session_id: String,
+    /// UTC timestamp of the most recent command in this tree
+    pub last_seen: DateTime<Utc>,
+    /// Total number of direct sessions in this tree (1 = no subagents)
+    pub session_count: usize,
+    /// Total commands across root + all child sessions
+    pub commands: usize,
+    /// Total tokens saved across root + all child sessions
+    pub saved_tokens: usize,
+    /// Average savings percentage across all commands in this tree
     pub avg_savings_pct: f64,
 }
 
@@ -339,6 +387,15 @@ impl Tracker {
             "CREATE INDEX IF NOT EXISTS idx_session_id ON commands(session_id)",
             [],
         );
+        // Migration: add parent_session_id column for subagent aggregation
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN parent_session_id TEXT DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parent_session_id ON commands(parent_session_id)",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS parse_failures (
@@ -381,7 +438,8 @@ impl Tracker {
                 savings_pct REAL NOT NULL,
                 exec_time_ms INTEGER DEFAULT 0,
                 project_path TEXT DEFAULT '',
-                session_id TEXT DEFAULT ''
+                session_id TEXT DEFAULT '',
+                parent_session_id TEXT DEFAULT ''
             )",
             [],
         )?;
@@ -395,6 +453,10 @@ impl Tracker {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_id ON commands(session_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parent_session_id ON commands(parent_session_id)",
             [],
         )?;
         self.conn.execute(
@@ -453,16 +515,18 @@ impl Tracker {
 
         let project_path = current_project_path_string();
         let session_id = current_session_id();
+        let parent_session_id = current_parent_session_id();
 
         self.conn.execute(
-            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, session_id, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, session_id, parent_session_id, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 Utc::now().to_rfc3339(),
                 original_cmd,
                 rtk_cmd,
                 project_path,
                 session_id,
+                parent_session_id,
                 input_tokens as i64,
                 output_tokens as i64,
                 saved as i64,
@@ -1129,6 +1193,155 @@ impl Tracker {
                 commands: row.get::<_, i64>(2)? as usize,
                 saved_tokens: row.get::<_, i64>(3)? as usize,
                 avg_savings_pct: row.get(4)?,
+            })
+        })?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Get full gain summary for a root session tree (parent + all its subagents).
+    ///
+    /// Matches commands where `session_id GLOB prefix*` (the root itself) OR
+    /// `parent_session_id GLOB prefix*` (any child that declared this as parent).
+    pub fn get_summary_for_root_session(&self, prefix: &str) -> Result<GainSummary> {
+        let glob = format!("{prefix}*");
+        let mut total_commands = 0usize;
+        let mut total_input = 0usize;
+        let mut total_output = 0usize;
+        let mut total_saved = 0usize;
+        let mut total_time_ms = 0u64;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms
+             FROM commands
+             WHERE session_id GLOB ?1 OR parent_session_id GLOB ?1",
+        )?;
+        let rows = stmt.query_map(params![glob], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        for row in rows {
+            let (input, output, saved, time_ms) = row?;
+            total_commands += 1;
+            total_input += input;
+            total_output += output;
+            total_saved += saved;
+            total_time_ms += time_ms;
+        }
+
+        let avg_savings_pct = if total_input > 0 {
+            (total_saved as f64 / total_input as f64) * 100.0
+        } else {
+            0.0
+        };
+        let avg_time_ms = if total_commands > 0 {
+            total_time_ms / total_commands as u64
+        } else {
+            0
+        };
+
+        let by_command = {
+            let mut stmt = self.conn.prepare(
+                "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+                 FROM commands
+                 WHERE session_id GLOB ?1 OR parent_session_id GLOB ?1
+                 GROUP BY rtk_cmd
+                 ORDER BY SUM(saved_tokens) DESC
+                 LIMIT 10",
+            )?;
+            let rows = stmt.query_map(params![glob], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let by_day = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DATE(timestamp), SUM(saved_tokens)
+                 FROM commands
+                 WHERE session_id GLOB ?1 OR parent_session_id GLOB ?1
+                 GROUP BY DATE(timestamp)
+                 ORDER BY DATE(timestamp) ASC
+                 LIMIT 30",
+            )?;
+            let rows = stmt.query_map(params![glob], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(GainSummary {
+            total_commands,
+            total_input,
+            total_output,
+            total_saved,
+            avg_savings_pct,
+            total_time_ms,
+            avg_time_ms,
+            by_command,
+            by_day,
+        })
+    }
+
+    /// Get per-root-session token savings, most recent first.
+    ///
+    /// Each row represents one top-level session and its entire subagent tree.
+    /// A "root session" is a session with no `parent_session_id` (or whose
+    /// parent is not itself in the DB). Child sessions (subagents) are folded
+    /// into their parent's row.
+    ///
+    /// When `filter` is `Some(prefix)`, only root sessions whose ID starts with
+    /// that prefix are returned. When `None`, returns up to 20 most recent roots.
+    pub fn get_by_root_session(&self, filter: Option<&str>) -> Result<Vec<RootSessionStat>> {
+        let prefix_filter = filter.map(|f| format!("{f}*"));
+        let limit: i64 = if filter.is_some() { i64::MAX } else { 20 };
+
+        // Step 1: collect all commands grouped by their effective root session.
+        // A command belongs to the root if:
+        //   (a) its parent_session_id is '' → it IS the root (use session_id)
+        //   (b) its parent_session_id is set → use parent_session_id as root
+        // We only handle one level of nesting (parent spawns children). Deeper
+        // nesting is uncommon in current Claude Code usage.
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                CASE WHEN parent_session_id = '' THEN session_id ELSE parent_session_id END
+                    AS root_id,
+                COUNT(DISTINCT session_id) AS session_count,
+                MAX(timestamp)             AS last_ts,
+                COUNT(*)                   AS cmd_count,
+                COALESCE(SUM(saved_tokens), 0)  AS total_saved,
+                COALESCE(AVG(savings_pct), 0.0) AS avg_pct
+             FROM commands
+             WHERE session_id != ''
+               AND (?1 IS NULL OR
+                    CASE WHEN parent_session_id = '' THEN session_id ELSE parent_session_id END
+                    GLOB ?1)
+             GROUP BY root_id
+             ORDER BY last_ts DESC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![prefix_filter, limit], |row| {
+            let last_seen = DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(RootSessionStat {
+                session_id: row.get(0)?,
+                session_count: row.get::<_, i64>(1)? as usize,
+                last_seen,
+                commands: row.get::<_, i64>(3)? as usize,
+                saved_tokens: row.get::<_, i64>(4)? as usize,
+                avg_savings_pct: row.get(5)?,
             })
         })?;
 
@@ -1871,6 +2084,26 @@ mod tests {
         output_tokens: usize,
         session_id: &str,
     ) {
+        insert_with_parent_session(
+            tracker,
+            original_cmd,
+            rtk_cmd,
+            input_tokens,
+            output_tokens,
+            session_id,
+            "",
+        );
+    }
+
+    fn insert_with_parent_session(
+        tracker: &Tracker,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        session_id: &str,
+        parent_session_id: &str,
+    ) {
         let saved = input_tokens.saturating_sub(output_tokens);
         let pct = if input_tokens > 0 {
             saved as f64 / input_tokens as f64 * 100.0
@@ -1880,13 +2113,14 @@ mod tests {
         tracker
             .conn
             .execute(
-                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, session_id,
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, session_id, parent_session_id,
                   input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
-                 VALUES (datetime('now'), ?1, ?2, '', ?3, ?4, ?5, ?6, ?7, 10)",
+                 VALUES (datetime('now'), ?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, 10)",
                 rusqlite::params![
                     original_cmd,
                     rtk_cmd,
                     session_id,
+                    parent_session_id,
                     input_tokens as i64,
                     output_tokens as i64,
                     saved as i64,
@@ -1901,17 +2135,37 @@ mod tests {
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
 
         insert_with_session(&tracker, "git log", "rtk git log", 1000, 100, "sess-aaa");
-        insert_with_session(&tracker, "git status", "rtk git status", 500, 50, "sess-aaa");
-        insert_with_session(&tracker, "cargo test", "rtk cargo test", 2000, 200, "sess-bbb");
+        insert_with_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            500,
+            50,
+            "sess-aaa",
+        );
+        insert_with_session(
+            &tracker,
+            "cargo test",
+            "rtk cargo test",
+            2000,
+            200,
+            "sess-bbb",
+        );
 
         let sessions = tracker.get_by_session(None).expect("get_by_session failed");
         assert_eq!(sessions.len(), 2, "should have 2 distinct sessions");
 
-        let aaa = sessions.iter().find(|s| s.session_id == "sess-aaa").unwrap();
+        let aaa = sessions
+            .iter()
+            .find(|s| s.session_id == "sess-aaa")
+            .unwrap();
         assert_eq!(aaa.commands, 2);
         assert_eq!(aaa.saved_tokens, 1350); // (1000-100) + (500-50)
 
-        let bbb = sessions.iter().find(|s| s.session_id == "sess-bbb").unwrap();
+        let bbb = sessions
+            .iter()
+            .find(|s| s.session_id == "sess-bbb")
+            .unwrap();
         assert_eq!(bbb.commands, 1);
         assert_eq!(bbb.saved_tokens, 1800);
     }
@@ -1966,7 +2220,10 @@ mod tests {
             .expect("insert failed");
 
         let sessions = tracker.get_by_session(None).expect("get_by_session failed");
-        assert_eq!(sessions[0].session_id, "sess-new", "newest session must be first");
+        assert_eq!(
+            sessions[0].session_id, "sess-new",
+            "newest session must be first"
+        );
         assert_eq!(sessions[1].session_id, "sess-old");
     }
 
@@ -1982,8 +2239,22 @@ mod tests {
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
 
         insert_with_session(&tracker, "git log", "rtk git log", 1000, 100, "aaaa-1111");
-        insert_with_session(&tracker, "git status", "rtk git status", 500, 50, "aaaa-2222");
-        insert_with_session(&tracker, "cargo test", "rtk cargo test", 2000, 200, "bbbb-3333");
+        insert_with_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            500,
+            50,
+            "aaaa-2222",
+        );
+        insert_with_session(
+            &tracker,
+            "cargo test",
+            "rtk cargo test",
+            2000,
+            200,
+            "bbbb-3333",
+        );
 
         // filter by "aaaa" prefix matches both aaaa-* sessions
         let filtered = tracker
@@ -2006,6 +2277,125 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    // ── get_by_root_session tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_get_by_root_session_aggregates_children() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+
+        // Parent session: 900 saved
+        insert_with_parent_session(
+            &tracker,
+            "git log",
+            "rtk git log",
+            1000,
+            100,
+            "parent-1",
+            "",
+        );
+        // Child 1 of parent-1: 800 saved
+        insert_with_parent_session(
+            &tracker,
+            "cargo test",
+            "rtk cargo test",
+            1000,
+            200,
+            "child-a",
+            "parent-1",
+        );
+        // Child 2 of parent-1: 700 saved
+        insert_with_parent_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            1000,
+            300,
+            "child-b",
+            "parent-1",
+        );
+
+        let roots = tracker
+            .get_by_root_session(None)
+            .expect("get_by_root_session failed");
+        assert_eq!(roots.len(), 1, "all children fold under one root");
+
+        let root = &roots[0];
+        assert_eq!(root.session_id, "parent-1");
+        assert_eq!(root.session_count, 3, "parent + 2 children = 3 sessions");
+        assert_eq!(root.commands, 3);
+        assert_eq!(root.saved_tokens, 900 + 800 + 700);
+    }
+
+    #[test]
+    fn test_get_by_root_session_independent_sessions_are_separate_roots() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+
+        insert_with_parent_session(&tracker, "git log", "rtk git log", 1000, 100, "sess-a", "");
+        insert_with_parent_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            500,
+            50,
+            "sess-b",
+            "",
+        );
+
+        let roots = tracker
+            .get_by_root_session(None)
+            .expect("get_by_root_session failed");
+        assert_eq!(roots.len(), 2, "two independent sessions → two roots");
+    }
+
+    #[test]
+    fn test_get_by_root_session_prefix_filter() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+
+        insert_with_parent_session(
+            &tracker,
+            "git log",
+            "rtk git log",
+            1000,
+            100,
+            "aaaa-root",
+            "",
+        );
+        insert_with_parent_session(
+            &tracker,
+            "cargo test",
+            "rtk cargo test",
+            500,
+            50,
+            "aaaa-child",
+            "aaaa-root",
+        );
+        insert_with_parent_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            800,
+            200,
+            "bbbb-root",
+            "",
+        );
+
+        let filtered = tracker
+            .get_by_root_session(Some("aaaa"))
+            .expect("get_by_root_session failed");
+        assert_eq!(filtered.len(), 1, "prefix 'aaaa' matches only one root");
+        assert_eq!(filtered[0].session_id, "aaaa-root");
+        assert_eq!(filtered[0].session_count, 2); // root + child
+    }
+
+    #[test]
+    fn test_get_by_root_session_empty_db() {
+        let tracker = Tracker::new_in_memory().expect("in-memory tracker");
+        let roots = tracker
+            .get_by_root_session(None)
+            .expect("get_by_root_session failed");
+        assert!(roots.is_empty());
+    }
+
     #[test]
     fn test_get_by_session_savings_pct() {
         let tracker = Tracker::new_in_memory().expect("in-memory tracker");
@@ -2013,7 +2403,14 @@ mod tests {
         // 80% savings
         insert_with_session(&tracker, "git log", "rtk git log", 1000, 200, "sess-x");
         // 60% savings
-        insert_with_session(&tracker, "git status", "rtk git status", 1000, 400, "sess-x");
+        insert_with_session(
+            &tracker,
+            "git status",
+            "rtk git status",
+            1000,
+            400,
+            "sess-x",
+        );
 
         let sessions = tracker.get_by_session(None).expect("get_by_session failed");
         assert_eq!(sessions.len(), 1);

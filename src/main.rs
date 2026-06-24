@@ -73,6 +73,11 @@ struct Cli {
     /// Set SKIP_ENV_VALIDATION=1 for child processes (Next.js, tsc, lint, prisma)
     #[arg(long = "skip-env", global = true)]
     skip_env: bool,
+
+    /// Parent Claude Code session ID (injected by RTK's PreToolUse rewrite hook
+    /// when running as a subagent; used to aggregate savings across parent + children).
+    #[arg(long = "parent-session", global = true, hide = true)]
+    parent_session: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -433,6 +438,10 @@ enum Commands {
         /// Show per-session token savings; optionally filter to a specific session ID prefix
         #[arg(short = 'S', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
         session: Option<String>,
+        /// Show per-root-session savings (parent + all subagents aggregated);
+        /// optionally filter to a specific root session ID prefix
+        #[arg(long = "parent-session", value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
+        parent_session: Option<String>,
         /// Show parse failure log (commands that fell back to raw execution)
         #[arg(short = 'F', long)]
         failures: bool,
@@ -1482,6 +1491,11 @@ fn run_cli() -> Result<i32> {
         }
     };
 
+    // Wire --parent-session CLI flag into the tracking layer before any record() calls.
+    if let Some(ref ps) = cli.parent_session {
+        core::tracking::set_parent_session_id(ps.clone());
+    }
+
     // Warn if installed hook is outdated/missing (1/day, non-blocking).
     // Skip for Gain — it shows its own inline hook warning.
     if !matches!(cli.command, Commands::Gain { .. }) {
@@ -1997,6 +2011,7 @@ fn run_cli() -> Result<i32> {
             graph,
             history,
             session,
+            parent_session,
             quota,
             tier,
             daily,
@@ -2013,6 +2028,7 @@ fn run_cli() -> Result<i32> {
                 graph,
                 history,
                 session.as_deref(),
+                parent_session.as_deref(),
                 quota,
                 &tier,
                 daily,
